@@ -12,8 +12,8 @@ import (
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	"github.com/brocaar/chirpstack-api/go/as/integration"
-	models "github.com/brocaar/chirpstack-application-server/internal/integration"
+	"github.com/brocaar/chirpstack-api/go/v3/as/integration"
+	"github.com/brocaar/chirpstack-application-server/internal/integration/models"
 	"github.com/brocaar/chirpstack-application-server/internal/storage"
 	"github.com/brocaar/lorawan"
 )
@@ -76,6 +76,10 @@ func marshalJSONV3(msg proto.Message) ([]byte, error) {
 		return jsonv3MarshalStatusEvent(v)
 	case *integration.LocationEvent:
 		return jsonv3MarshalLocationEvent(v)
+	case *integration.TxAckEvent:
+		return jsonv3MarshalTxAckEvent(v)
+	case *integration.IntegrationEvent:
+		return jsonv3MarshalIntegrationEvent(v)
 	default:
 		return nil, fmt.Errorf("unknown message type: %T", msg)
 	}
@@ -86,7 +90,6 @@ func jsonv3MarshalUplinkEvent(msg *integration.UplinkEvent) ([]byte, error) {
 	var obj interface{}
 	if msg.ObjectJson != "" {
 		if err := json.Unmarshal([]byte(msg.ObjectJson), &obj); err != nil {
-			fmt.Println(msg.ObjectJson)
 			log.WithError(err).Error("integration/marshaler: unmarshal json error")
 		}
 	}
@@ -121,7 +124,7 @@ func jsonv3MarshalUplinkEvent(msg *integration.UplinkEvent) ([]byte, error) {
 
 		if msg.RxInfo[i].Time != nil {
 			t, err := ptypes.Timestamp(msg.RxInfo[i].Time)
-			if err != nil {
+			if err == nil {
 				rxInfo.Time = &t
 			}
 		}
@@ -178,7 +181,7 @@ func jsonv3MarshalJoinEvent(msg *integration.JoinEvent) ([]byte, error) {
 
 		if msg.RxInfo[i].Time != nil {
 			t, err := ptypes.Timestamp(msg.RxInfo[i].Time)
-			if err != nil {
+			if err == nil {
 				rxInfo.Time = &t
 			}
 		}
@@ -274,5 +277,38 @@ func jsonv3MarshalLocationEvent(msg *integration.LocationEvent) ([]byte, error) 
 
 	copy(m.DevEUI[:], msg.DevEui)
 
+	return json.Marshal(m)
+}
+
+func jsonv3MarshalTxAckEvent(msg *integration.TxAckEvent) ([]byte, error) {
+	m := models.TxAckNotification{
+		ApplicationID:   int64(msg.ApplicationId),
+		ApplicationName: msg.ApplicationName,
+		DeviceName:      msg.DeviceName,
+		FCnt:            msg.FCnt,
+		Tags:            msg.Tags,
+	}
+
+	copy(m.DevEUI[:], msg.DevEui)
+	return json.Marshal(m)
+}
+
+func jsonv3MarshalIntegrationEvent(msg *integration.IntegrationEvent) ([]byte, error) {
+	var obj interface{}
+	if msg.ObjectJson != "" {
+		if err := json.Unmarshal([]byte(msg.ObjectJson), &obj); err != nil {
+			log.WithError(err).Error("integration/marshaler: unmarshal json error")
+		}
+	}
+
+	m := models.IntegrationNotification{
+		ApplicationID:   int64(msg.ApplicationId),
+		ApplicationName: msg.ApplicationName,
+		DeviceName:      msg.DeviceName,
+		Tags:            msg.Tags,
+		Object:          obj,
+	}
+
+	copy(m.DevEUI[:], msg.DevEui)
 	return json.Marshal(m)
 }

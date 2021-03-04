@@ -5,8 +5,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/brocaar/chirpstack-application-server/internal/logging"
-	"github.com/brocaar/lorawan"
 	"github.com/gofrs/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
@@ -14,7 +12,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	"github.com/brocaar/chirpstack-api/go/ns"
+	"github.com/brocaar/chirpstack-api/go/v3/ns"
+	"github.com/brocaar/chirpstack-application-server/internal/logging"
+	"github.com/brocaar/lorawan"
 )
 
 // MulticastGroup defines the multicast-group.
@@ -23,7 +23,6 @@ type MulticastGroup struct {
 	UpdatedAt        time.Time         `db:"updated_at"`
 	Name             string            `db:"name"`
 	MCAppSKey        lorawan.AES128Key `db:"mc_app_s_key"`
-	MCKey            lorawan.AES128Key `db:"mc_key"`
 	ServiceProfileID uuid.UUID         `db:"service_profile_id"`
 	MulticastGroup   ns.MulticastGroup `db:"-"`
 }
@@ -38,8 +37,20 @@ type MulticastGroupListItem struct {
 	ServiceProfileName string    `db:"service_profile_name"`
 }
 
+// Validate validates the service-profile data.
+func (mg MulticastGroup) Validate() error {
+	if strings.TrimSpace(mg.Name) == "" || len(mg.Name) > 100 {
+		return ErrMulticastGroupInvalidName
+	}
+	return nil
+}
+
 // CreateMulticastGroup creates the given multicast-group.
 func CreateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) error {
+	if err := mg.Validate(); err != nil {
+		return errors.Wrap(err, "validate error")
+	}
+
 	mgID, err := uuid.NewV4()
 	if err != nil {
 		return errors.Wrap(err, "new uuid v4 error")
@@ -57,9 +68,8 @@ func CreateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) 
 			updated_at,
 			name,
 			service_profile_id,
-			mc_app_s_key,
-			mc_key
-		) values ($1, $2, $3, $4, $5, $6, $7)
+			mc_app_s_key
+		) values ($1, $2, $3, $4, $5, $6)
 	`,
 		mgID,
 		mg.CreatedAt,
@@ -67,7 +77,6 @@ func CreateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) 
 		mg.Name,
 		mg.ServiceProfileID,
 		mg.MCAppSKey,
-		mg.MCKey,
 	)
 	if err != nil {
 		return handlePSQLError(Insert, err, "insert error")
@@ -108,8 +117,7 @@ func GetMulticastGroup(ctx context.Context, db sqlx.Queryer, id uuid.UUID, forUp
 			updated_at,
 			name,
 			service_profile_id,
-			mc_app_s_key,
-			mc_key
+			mc_app_s_key
 		from
 			multicast_group
 		where
@@ -146,6 +154,10 @@ func GetMulticastGroup(ctx context.Context, db sqlx.Queryer, id uuid.UUID, forUp
 
 // UpdateMulticastGroup updates the given multicast-group.
 func UpdateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) error {
+	if err := mg.Validate(); err != nil {
+		return errors.Wrap(err, "validate error")
+	}
+
 	mgID, err := uuid.FromBytes(mg.MulticastGroup.Id)
 	if err != nil {
 		return errors.Wrap(err, "uuid from bytes error")
@@ -158,8 +170,7 @@ func UpdateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) 
 		set
 			updated_at = $2,
 			name = $3,
-			mc_app_s_key = $4,
-			mc_key = $5
+			mc_app_s_key = $4
 		where
 			id = $1
 	`,
@@ -167,7 +178,6 @@ func UpdateMulticastGroup(ctx context.Context, db sqlx.Ext, mg *MulticastGroup) 
 		mg.UpdatedAt,
 		mg.Name,
 		mg.MCAppSKey,
-		mg.MCKey,
 	)
 	if err != nil {
 		return handlePSQLError(Update, err, "update error")

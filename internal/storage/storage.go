@@ -1,12 +1,12 @@
 package storage
 
 import (
-	"fmt"
+	"crypto/tls"
 	"strings"
 	"time"
 
+	"github.com/go-redis/redis/v7"
 	uuid "github.com/gofrs/uuid"
-	"github.com/gomodule/redigo/redis"
 	"github.com/jmoiron/sqlx"
 	"github.com/pkg/errors"
 	migrate "github.com/rubenv/sql-migrate"
@@ -17,7 +17,8 @@ import (
 )
 
 var (
-	jwtsecret           []byte
+	jwtsecret []byte
+	// HashIterations denfines the number of times a password is hashed.
 	HashIterations      = 100000
 	applicationServerID uuid.UUID
 )
@@ -56,31 +57,43 @@ func Setup(c config.Config) error {
 		c.Metrics.Redis.MonthAggregationTTL,
 	)
 
-	log.Info("storage: setting up Redis pool")
-	redisPool = &redis.Pool{
-		MaxIdle:     10,
-		IdleTimeout: c.Redis.IdleTimeout,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.DialURL(c.Redis.URL,
-				redis.DialReadTimeout(redisDialReadTimeout),
-				redis.DialWriteTimeout(redisDialWriteTimeout),
-			)
-			if err != nil {
-				return nil, fmt.Errorf("redis connection error: %s", err)
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			if time.Now().Sub(t) < onBorrowPingInterval {
-				return nil
-			}
+	log.Info("storage: setting up Redis client")
+	if len(c.Redis.Servers) == 0 {
+		return errors.New("at least one redis server must be configured")
+	}
 
-			_, err := c.Do("PING")
-			if err != nil {
-				return fmt.Errorf("ping redis error: %s", err)
-			}
-			return nil
-		},
+	var tlsConfig *tls.Config
+	if c.Redis.TLSEnabled {
+		tlsConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	if c.Redis.Cluster {
+		redisClient = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:     c.Redis.Servers,
+			PoolSize:  c.Redis.PoolSize,
+			Password:  c.Redis.Password,
+			TLSConfig: tlsConfig,
+		})
+	} else if c.Redis.MasterName != "" {
+		redisClient = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:       c.Redis.MasterName,
+			SentinelAddrs:    c.Redis.Servers,
+			SentinelPassword: c.Redis.Password,
+			DB:               c.Redis.Database,
+			PoolSize:         c.Redis.PoolSize,
+			Password:         c.Redis.Password,
+			TLSConfig:        tlsConfig,
+		})
+	} else {
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:      c.Redis.Servers[0],
+			DB:        c.Redis.Database,
+			Password:  c.Redis.Password,
+			PoolSize:  c.Redis.PoolSize,
+			TLSConfig: tlsConfig,
+		})
 	}
 
 	log.Info("storage: connecting to PostgreSQL database")

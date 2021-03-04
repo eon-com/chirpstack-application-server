@@ -3,25 +3,36 @@ package postgresql
 import (
 	"context"
 	"database/sql"
+	"embed"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/gofrs/uuid"
+	"github.com/golang-migrate/migrate/v4"
+	"github.com/golang-migrate/migrate/v4/database/postgres"
+	"github.com/golang-migrate/migrate/v4/source/httpfs"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/jmoiron/sqlx"
+
 	"github.com/lib/pq/hstore"
 	"github.com/mmcloughlin/geohash"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 
-	pb "github.com/brocaar/chirpstack-api/go/as/integration"
-	"github.com/brocaar/chirpstack-api/go/gw"
+	pb "github.com/brocaar/chirpstack-api/go/v3/as/integration"
+	"github.com/brocaar/chirpstack-api/go/v3/gw"
 	"github.com/brocaar/chirpstack-application-server/internal/config"
-	"github.com/brocaar/chirpstack-application-server/internal/integration"
+	"github.com/brocaar/chirpstack-application-server/internal/integration/models"
 	"github.com/brocaar/chirpstack-application-server/internal/logging"
 	"github.com/brocaar/chirpstack-application-server/internal/storage"
 	"github.com/brocaar/lorawan"
 )
+
+// Migrations
+//go:embed migrations/*
+var migrations embed.FS
 
 // Integration implements a PostgreSQL integration.
 type Integration struct {
@@ -44,6 +55,12 @@ func New(conf config.IntegrationPostgreSQLConfig) (*Integration, error) {
 		}
 	}
 
+	d.SetMaxOpenConns(conf.MaxOpenConnections)
+	d.SetMaxIdleConns(conf.MaxIdleConnections)
+
+	if err := MigrateUp(d); err != nil {
+		return nil, err
+	}
 	return &Integration{
 		db: d,
 	}, nil
@@ -57,8 +74,82 @@ func (i *Integration) Close() error {
 	return nil
 }
 
-// SendDataUp stores the uplink data into the device_up table.
-func (i *Integration) SendDataUp(ctx context.Context, vars map[string]string, pl pb.UplinkEvent) error {
+// MigrateUp configure postgres-integration migration down
+func MigrateUp(db *sqlx.DB) error {
+	log.Info("integration/postgresql: applying PostgreSQL schema migrations")
+
+	driver, err := postgres.WithInstance(db.DB, &postgres.Config{})
+	if err != nil {
+		return fmt.Errorf("integration/postgresql: migrate postgres driver error: %w", err)
+	}
+
+	src, err := httpfs.New(http.FS(migrations), "/migrations")
+	if err != nil {
+		return fmt.Errorf("new httpfs error: %w", err)
+	}
+
+	m, err := migrate.NewWithInstance("httpfs", src, "postgres", driver)
+	if err != nil {
+		return fmt.Errorf("integration/postgresql: new migrate instance error: %w", err)
+	}
+
+	oldVersion, _, _ := m.Version()
+
+	if err := m.Up(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("integration/postgresql: migrate up error: %w", err)
+	}
+
+	newVersion, _, _ := m.Version()
+
+	if oldVersion != newVersion {
+		log.WithFields(log.Fields{
+			"from_version": oldVersion,
+			"to_version":   newVersion,
+		}).Info("integration/postgresql: applied database migrations")
+	}
+
+	return nil
+}
+
+// MigrateDown configure postgres-integration migration down
+func MigrateDown(db *sqlx.DB) error {
+	log.Info("integration/postgresql: reverting PostgreSQL schema migrations")
+
+	driver, err := postgres.WithInstance(db.DB, &postgres.Config{})
+	if err != nil {
+		return fmt.Errorf("integration/postgresql: migrate postgres driver error: %w", err)
+	}
+
+	src, err := httpfs.New(http.FS(migrations), "/migrations")
+	if err != nil {
+		return fmt.Errorf("new httpfs error: %w", err)
+	}
+
+	m, err := migrate.NewWithInstance("httpfs", src, "postgres", driver)
+	if err != nil {
+		return fmt.Errorf("integration/postgresql: new migrate instance error: %w", err)
+	}
+
+	oldVersion, _, _ := m.Version()
+
+	if err := m.Down(); err != nil && err != migrate.ErrNoChange {
+		return fmt.Errorf("integration/postgresql: migrate down error: %w", err)
+	}
+
+	newVersion, _, _ := m.Version()
+
+	if oldVersion != newVersion {
+		log.WithFields(log.Fields{
+			"from_version": oldVersion,
+			"to_version":   newVersion,
+		}).Info("integration/postgresql: applied database migrations")
+	}
+
+	return nil
+}
+
+// HandleUplinkEvent writes an UplinkEvent into the database.
+func (i *Integration) HandleUplinkEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.UplinkEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -138,8 +229,8 @@ func (i *Integration) SendDataUp(ctx context.Context, vars map[string]string, pl
 	return nil
 }
 
-// SendStatusNotification stores the device-status in the device_status table.
-func (i *Integration) SendStatusNotification(ctx context.Context, vars map[string]string, pl pb.StatusEvent) error {
+// HandleStatusEvent writes a StatusEvent into the database.
+func (i *Integration) HandleStatusEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.StatusEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -192,8 +283,8 @@ func (i *Integration) SendStatusNotification(ctx context.Context, vars map[strin
 	return nil
 }
 
-// SendJoinNotification stores the join in the device_join table.
-func (i *Integration) SendJoinNotification(ctx context.Context, vars map[string]string, pl pb.JoinEvent) error {
+// HandleJoinEvent writes a JoinEvent into the database.
+func (i *Integration) HandleJoinEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.JoinEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -242,8 +333,8 @@ func (i *Integration) SendJoinNotification(ctx context.Context, vars map[string]
 	return nil
 }
 
-// SendACKNotification stores the ACK in the device_ack table.
-func (i *Integration) SendACKNotification(ctx context.Context, vars map[string]string, pl pb.AckEvent) error {
+// HandleAckEvent writes an AckEvent into the database.
+func (i *Integration) HandleAckEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.AckEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -292,8 +383,8 @@ func (i *Integration) SendACKNotification(ctx context.Context, vars map[string]s
 	return nil
 }
 
-// SendErrorNotification stores the error in the device_error table.
-func (i *Integration) SendErrorNotification(ctx context.Context, vars map[string]string, pl pb.ErrorEvent) error {
+// HandleErrorEvent writes an ErrorEvent into the database.
+func (i *Integration) HandleErrorEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.ErrorEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -344,8 +435,8 @@ func (i *Integration) SendErrorNotification(ctx context.Context, vars map[string
 	return nil
 }
 
-// SendLocationNotification stores the location in the device_location table.
-func (i *Integration) SendLocationNotification(ctx context.Context, vars map[string]string, pl pb.LocationEvent) error {
+// HandleLocationEvent writes a LocationEvent into the database.
+func (i *Integration) HandleLocationEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.LocationEvent) error {
 	// use an UUID here so that we can later refactor this for correlation
 	id, err := uuid.NewV4()
 	if err != nil {
@@ -400,17 +491,29 @@ func (i *Integration) SendLocationNotification(ctx context.Context, vars map[str
 	return nil
 }
 
+// HandleTxAckEvent is not implemented.
+// TODO: implement this + schema migrations for the PostgreSQL database!
+func (i *Integration) HandleTxAckEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.TxAckEvent) error {
+	return nil
+}
+
+// HandleIntegrationEvent is not implemented.
+// TODO: implement this + schema migrations for the PostgreSQL database!
+func (i *Integration) HandleIntegrationEvent(ctx context.Context, _ models.Integration, vars map[string]string, pl pb.IntegrationEvent) error {
+	return nil
+}
+
 // DataDownChan return nil.
-func (i *Integration) DataDownChan() chan integration.DataDownPayload {
+func (i *Integration) DataDownChan() chan models.DataDownPayload {
 	return nil
 }
 
 func getRXInfoJSON(rxInfo []*gw.UplinkRXInfo) (json.RawMessage, error) {
-	var out []integration.RXInfo
+	var out []models.RXInfo
 	var gatewayIDs []lorawan.EUI64
 
 	for i := range rxInfo {
-		rx := integration.RXInfo{
+		rx := models.RXInfo{
 			RSSI:    int(rxInfo[i].Rssi),
 			LoRaSNR: rxInfo[i].LoraSnr,
 		}
@@ -428,7 +531,7 @@ func getRXInfoJSON(rxInfo []*gw.UplinkRXInfo) (json.RawMessage, error) {
 		}
 
 		if rxInfo[i].Location != nil {
-			rx.Location = &integration.Location{
+			rx.Location = &models.Location{
 				Latitude:  rxInfo[i].Location.Latitude,
 				Longitude: rxInfo[i].Location.Longitude,
 				Altitude:  rxInfo[i].Location.Altitude,

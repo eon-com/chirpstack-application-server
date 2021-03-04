@@ -24,13 +24,17 @@ class ListServiceProfiles extends Component {
   }
 
   getPage(limit, offset, callbackFunc) {
-    ServiceProfileStore.list(this.props.match.params.organizationID, limit, offset, callbackFunc);
+    ServiceProfileStore.list(this.props.match.params.organizationID, 0, limit, offset, callbackFunc);
   }
 
   getRow(obj) {
     return(
-      <TableRow key={obj.id}>
+      <TableRow
+        key={obj.id}
+        hover
+      >
         <TableCellLink to={`/organizations/${this.props.match.params.organizationID}/service-profiles/${obj.id}`}>{obj.name}</TableCellLink>
+        <TableCell>{obj.networkServerName}</TableCell>
       </TableRow>
     );
   }
@@ -56,6 +60,7 @@ class ListServiceProfiles extends Component {
             header={
               <TableRow>
                 <TableCell>Name</TableCell>
+                <TableCell>Network Server</TableCell>
               </TableRow>
             }
             getPage={this.getPage}

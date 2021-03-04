@@ -12,11 +12,11 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/brocaar/chirpstack-api/go/as"
-	pb "github.com/brocaar/chirpstack-api/go/as/integration"
-	"github.com/brocaar/chirpstack-api/go/common"
-	gwPB "github.com/brocaar/chirpstack-api/go/gw"
-	"github.com/brocaar/chirpstack-api/go/ns"
+	"github.com/brocaar/chirpstack-api/go/v3/as"
+	pb "github.com/brocaar/chirpstack-api/go/v3/as/integration"
+	"github.com/brocaar/chirpstack-api/go/v3/common"
+	gwPB "github.com/brocaar/chirpstack-api/go/v3/gw"
+	"github.com/brocaar/chirpstack-api/go/v3/ns"
 	"github.com/brocaar/chirpstack-application-server/internal/backend/networkserver"
 	nsmock "github.com/brocaar/chirpstack-application-server/internal/backend/networkserver/mock"
 	"github.com/brocaar/chirpstack-application-server/internal/codec"
@@ -36,7 +36,7 @@ func (ts *ASTestSuite) SetupSuite() {
 	conf := test.GetConfig()
 	assert.NoError(storage.Setup(conf))
 	test.MustResetDB(storage.DB().DB)
-	test.MustFlushRedis(storage.RedisPool())
+	storage.RedisClient().FlushAll()
 }
 
 func (ts *ASTestSuite) TestApplicationServer() {
@@ -120,7 +120,7 @@ func (ts *ASTestSuite) TestApplicationServer() {
 	assert.NoError(storage.CreateGateway(context.Background(), storage.DB(), &gw))
 
 	h := mock.New()
-	integration.SetIntegration(h)
+	integration.SetMockIntegration(h)
 
 	ctx := context.Background()
 	api := NewApplicationServerAPI()
@@ -130,7 +130,7 @@ func (ts *ASTestSuite) TestApplicationServer() {
 
 		_, err := api.HandleError(ctx, &as.HandleErrorRequest{
 			DevEui: []byte{1, 2, 3, 4, 5, 6, 7, 8},
-			Type:   as.ErrorType_DATA_UP_FCNT,
+			Type:   as.ErrorType_DATA_UP_FCNT_RESET,
 			Error:  "BOOM!",
 			FCnt:   123,
 		})
@@ -141,7 +141,7 @@ func (ts *ASTestSuite) TestApplicationServer() {
 			ApplicationName: "test-app",
 			DeviceName:      "test-node",
 			DevEui:          []byte{1, 2, 3, 4, 5, 6, 7, 8},
-			Type:            pb.ErrorType_UPLINK_FCNT,
+			Type:            pb.ErrorType_UPLINK_FCNT_RESET,
 			Error:           "BOOM!",
 			FCnt:            123,
 			Tags: map[string]string{
@@ -206,6 +206,11 @@ func (ts *ASTestSuite) TestApplicationServer() {
 
 			plJoin := <-h.SendJoinNotificationChan
 			assert.Equal([]byte{1, 2, 3, 4}, plJoin.DevAddr)
+
+			d, err := storage.GetDevice(context.Background(), storage.DB(), d.DevEUI, false, true)
+			assert.NoError(err)
+			assert.Equal(lorawan.DevAddr{0x01, 0x02, 0x03, 0x04}, d.DevAddr)
+			assert.Equal(lorawan.AES128Key{0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8}, d.AppSKey)
 		})
 
 		t.Run("Activated device", func(t *testing.T) {
@@ -213,12 +218,9 @@ func (ts *ASTestSuite) TestApplicationServer() {
 			uplinkID, err := uuid.NewV4()
 			assert.NoError(err)
 
-			da := storage.DeviceActivation{
-				DevEUI:  d.DevEUI,
-				DevAddr: lorawan.DevAddr{},
-				AppSKey: lorawan.AES128Key{},
-			}
-			assert.NoError(storage.CreateDeviceActivation(context.Background(), storage.DB(), &da))
+			d.DevAddr = lorawan.DevAddr{}
+			d.AppSKey = lorawan.AES128Key{}
+			assert.NoError(storage.UpdateDevice(context.Background(), storage.DB(), &d, true))
 
 			now := time.Now().UTC()
 
@@ -253,6 +255,7 @@ func (ts *ASTestSuite) TestApplicationServer() {
 						},
 					},
 				},
+				ConfirmedUplink: true,
 			}
 			req.RxInfo[0].Time, _ = ptypes.TimestampProto(now)
 
@@ -282,6 +285,8 @@ func (ts *ASTestSuite) TestApplicationServer() {
 					Tags: map[string]string{
 						"foo": "bar",
 					},
+					ConfirmedUplink: true,
+					DevAddr:         d.DevAddr[:],
 				}, <-h.SendDataUpChan)
 			})
 
@@ -290,13 +295,13 @@ func (ts *ASTestSuite) TestApplicationServer() {
 
 				app.PayloadCodec = codec.CustomJSType
 				app.PayloadDecoderScript = `
-					function Decode(fPort, bytes) {
-						return {
-							"fPort": fPort,
-							"firstByte": bytes[0]
+						function Decode(fPort, bytes) {
+							return {
+								"fPort": fPort,
+								"firstByte": bytes[0]
+							}
 						}
-					}
-				`
+					`
 				assert.NoError(storage.UpdateApplication(context.Background(), storage.DB(), app))
 
 				_, err := api.HandleUplinkData(ctx, &req)
@@ -311,13 +316,13 @@ func (ts *ASTestSuite) TestApplicationServer() {
 
 				dp.PayloadCodec = codec.CustomJSType
 				dp.PayloadDecoderScript = `
-					function Decode(fPort, bytes) {
-						return {
-							"fPort": fPort + 1,
-							"firstByte": bytes[0] + 1
+						function Decode(fPort, bytes) {
+							return {
+								"fPort": fPort + 1,
+								"firstByte": bytes[0] + 1
+							}
 						}
-					}
-				`
+					`
 				assert.NoError(storage.UpdateDeviceProfile(context.Background(), storage.DB(), &dp))
 
 				_, err := api.HandleUplinkData(ctx, &req)
@@ -351,6 +356,9 @@ func (ts *ASTestSuite) TestApplicationServer() {
 			RxPacketsReceivedOk: 9,
 			TxPacketsReceived:   8,
 			TxPacketsEmitted:    7,
+			Metadata: map[string]string{
+				"foo": "bar",
+			},
 		}
 		_, err = api.HandleGatewayStats(ctx, &stats)
 		assert.NoError(err)
@@ -358,7 +366,7 @@ func (ts *ASTestSuite) TestApplicationServer() {
 		start := time.Now().Truncate(time.Minute)
 		end := time.Now()
 
-		metrics, err := storage.GetMetrics(context.Background(), storage.RedisPool(), storage.AggregationMinute, "gw:"+gw.MAC.String(), start, end)
+		metrics, err := storage.GetMetrics(context.Background(), storage.AggregationMinute, "gw:"+gw.MAC.String(), start, end)
 		assert.NoError(err)
 		assert.Len(metrics, 1)
 
@@ -369,6 +377,15 @@ func (ts *ASTestSuite) TestApplicationServer() {
 			"tx_ok_count": 7,
 		}, metrics[0].Metrics)
 		assert.Equal(start.UTC(), metrics[0].Time.UTC())
+
+		gw, err := storage.GetGateway(context.Background(), storage.DB(), gw.MAC, false)
+		assert.NoError(err)
+
+		assert.Equal(hstore.Hstore{
+			Map: map[string]sql.NullString{
+				"foo": sql.NullString{Valid: true, String: "bar"},
+			},
+		}, gw.Metadata)
 	})
 
 	ts.T().Run("SetDeviceStatus", func(t *testing.T) {
@@ -469,7 +486,11 @@ func (ts *ASTestSuite) TestApplicationServer() {
 				Latitude:  1.123,
 				Longitude: 2.123,
 				Altitude:  3.123,
-				Source:    common.LocationSource_GEO_RESOLVER,
+			},
+			UplinkIds: [][]byte{
+				{1},
+				{2},
+				{3},
 			},
 		})
 		assert.NoError(err)
@@ -483,7 +504,11 @@ func (ts *ASTestSuite) TestApplicationServer() {
 				Latitude:  1.123,
 				Longitude: 2.123,
 				Altitude:  3.123,
-				Source:    common.LocationSource_GEO_RESOLVER,
+			},
+			UplinkIds: [][]byte{
+				{1},
+				{2},
+				{3},
 			},
 			Tags: map[string]string{
 				"foo": "bar",

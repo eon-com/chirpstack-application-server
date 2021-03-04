@@ -15,10 +15,9 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	pb "github.com/brocaar/chirpstack-api/go/as/external/api"
-	"github.com/brocaar/chirpstack-api/go/common"
-	"github.com/brocaar/chirpstack-api/go/gw"
-	"github.com/brocaar/chirpstack-api/go/ns"
+	pb "github.com/brocaar/chirpstack-api/go/v3/as/external/api"
+	"github.com/brocaar/chirpstack-api/go/v3/common"
+	"github.com/brocaar/chirpstack-api/go/v3/ns"
 	"github.com/brocaar/chirpstack-application-server/internal/api/external/auth"
 	"github.com/brocaar/chirpstack-application-server/internal/api/helpers"
 	"github.com/brocaar/chirpstack-application-server/internal/backend/networkserver"
@@ -46,16 +45,19 @@ func (a *DeviceAPI) Create(ctx context.Context, req *pb.CreateDeviceRequest) (*e
 		return nil, grpc.Errorf(codes.InvalidArgument, "device must not be nil")
 	}
 
+	// decode DevEUI
 	var devEUI lorawan.EUI64
 	if err := devEUI.UnmarshalText([]byte(req.Device.DevEui)); err != nil {
 		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
 	}
 
+	// decode DeviceProfileID
 	dpID, err := uuid.FromString(req.Device.DeviceProfileId)
 	if err != nil {
 		return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
 	}
 
+	// validate access
 	if err := a.validator.Validate(ctx,
 		auth.ValidateNodesAccess(req.Device.ApplicationId, auth.Create)); err != nil {
 		return nil, grpc.Errorf(codes.Unauthenticated, "authentication failed: %s", err)
@@ -66,6 +68,21 @@ func (a *DeviceAPI) Create(ctx context.Context, req *pb.CreateDeviceRequest) (*e
 		req.Device.Name = req.Device.DevEui
 	}
 
+	// Validate that application and device-profile are under the same
+	// organization ID.
+	app, err := storage.GetApplication(ctx, storage.DB(), req.Device.ApplicationId)
+	if err != nil {
+		return nil, helpers.ErrToRPCError(err)
+	}
+	dp, err := storage.GetDeviceProfile(ctx, storage.DB(), dpID, false, true)
+	if err != nil {
+		return nil, helpers.ErrToRPCError(err)
+	}
+	if app.OrganizationID != dp.OrganizationID {
+		return nil, grpc.Errorf(codes.InvalidArgument, "device-profile and application must be under the same organization")
+	}
+
+	// Set Device struct.
 	d := storage.Device{
 		DevEUI:            devEUI,
 		ApplicationID:     req.Device.ApplicationId,
@@ -74,6 +91,7 @@ func (a *DeviceAPI) Create(ctx context.Context, req *pb.CreateDeviceRequest) (*e
 		Description:       req.Device.Description,
 		SkipFCntCheck:     req.Device.SkipFCntCheck,
 		ReferenceAltitude: req.Device.ReferenceAltitude,
+		IsDisabled:        req.Device.IsDisabled,
 		Variables: hstore.Hstore{
 			Map: make(map[string]sql.NullString),
 		},
@@ -81,18 +99,36 @@ func (a *DeviceAPI) Create(ctx context.Context, req *pb.CreateDeviceRequest) (*e
 			Map: make(map[string]sql.NullString),
 		},
 	}
-
 	for k, v := range req.Device.Variables {
 		d.Variables.Map[k] = sql.NullString{String: v, Valid: true}
 	}
-
 	for k, v := range req.Device.Tags {
 		d.Tags.Map[k] = sql.NullString{String: v, Valid: true}
 	}
 
-	// as this also performs a remote call to create the node on the
-	// network-server, wrap it in a transaction
+	// A transaction is needed as:
+	//  * A remote gRPC call is performed and in case of error, we want to
+	//    rollback the transaction.
+	//  * We want to lock the organization so that we can validate the
+	//    max device count.
 	err = storage.Transaction(func(tx sqlx.Ext) error {
+		org, err := storage.GetOrganization(ctx, tx, app.OrganizationID, true)
+		if err != nil {
+			return err
+		}
+
+		// Validate max. device count when != 0.
+		if org.MaxDeviceCount != 0 {
+			count, err := storage.GetDeviceCount(ctx, tx, storage.DeviceFilters{OrganizationID: app.OrganizationID})
+			if err != nil {
+				return err
+			}
+
+			if count >= org.MaxDeviceCount {
+				return storage.ErrOrganizationMaxDeviceCount
+			}
+		}
+
 		return storage.CreateDevice(ctx, tx, &d)
 	})
 	if err != nil {
@@ -128,6 +164,7 @@ func (a *DeviceAPI) Get(ctx context.Context, req *pb.GetDeviceRequest) (*pb.GetD
 			DeviceProfileId:   d.DeviceProfileID.String(),
 			SkipFCntCheck:     d.SkipFCntCheck,
 			ReferenceAltitude: d.ReferenceAltitude,
+			IsDisabled:        d.IsDisabled,
 			Variables:         make(map[string]string),
 			Tags:              make(map[string]string),
 		},
@@ -154,7 +191,6 @@ func (a *DeviceAPI) Get(ctx context.Context, req *pb.GetDeviceRequest) (*pb.GetD
 			Latitude:  *d.Latitude,
 			Longitude: *d.Longitude,
 			Altitude:  *d.Altitude,
-			Source:    common.LocationSource_GEO_RESOLVER,
 		}
 	}
 
@@ -181,8 +217,11 @@ func (a *DeviceAPI) List(ctx context.Context, req *pb.ListDeviceRequest) (*pb.Li
 	filters := storage.DeviceFilters{
 		ApplicationID: req.ApplicationId,
 		Search:        req.Search,
-		Limit:         int(req.Limit),
-		Offset:        int(req.Offset),
+		Tags: hstore.Hstore{
+			Map: make(map[string]sql.NullString),
+		},
+		Limit:  int(req.Limit),
+		Offset: int(req.Offset),
 	}
 
 	if req.MulticastGroupId != "" {
@@ -197,6 +236,10 @@ func (a *DeviceAPI) List(ctx context.Context, req *pb.ListDeviceRequest) (*pb.Li
 		if err != nil {
 			return nil, helpers.ErrToRPCError(err)
 		}
+	}
+
+	for k, v := range req.Tags {
+		filters.Tags.Map[k] = sql.NullString{String: v, Valid: true}
 	}
 
 	if filters.ApplicationID != 0 {
@@ -234,12 +277,12 @@ func (a *DeviceAPI) List(ctx context.Context, req *pb.ListDeviceRequest) (*pb.Li
 	}
 
 	if !idFilter {
-		isAdmin, err := a.validator.GetIsAdmin(ctx)
+		user, err := a.validator.GetUser(ctx)
 		if err != nil {
 			return nil, helpers.ErrToRPCError(err)
 		}
 
-		if !isAdmin {
+		if !user.IsAdmin {
 			return nil, grpc.Errorf(codes.Unauthenticated, "client must be global admin for unfiltered request")
 		}
 	}
@@ -278,6 +321,20 @@ func (a *DeviceAPI) Update(ctx context.Context, req *pb.UpdateDeviceRequest) (*e
 		return nil, grpc.Errorf(codes.Unauthenticated, "authentication failed: %s", err)
 	}
 
+	app, err := storage.GetApplication(ctx, storage.DB(), req.Device.ApplicationId)
+	if err != nil {
+		return nil, helpers.ErrToRPCError(err)
+	}
+
+	dp, err := storage.GetDeviceProfile(ctx, storage.DB(), dpID, false, true)
+	if err != nil {
+		return nil, helpers.ErrToRPCError(err)
+	}
+
+	if app.OrganizationID != dp.OrganizationID {
+		return nil, grpc.Errorf(codes.InvalidArgument, "device-profile and application must be under the same organization")
+	}
+
 	err = storage.Transaction(func(tx sqlx.Ext) error {
 		d, err := storage.GetDevice(ctx, tx, devEUI, true, false)
 		if err != nil {
@@ -310,6 +367,7 @@ func (a *DeviceAPI) Update(ctx context.Context, req *pb.UpdateDeviceRequest) (*e
 		d.Description = req.Device.Description
 		d.SkipFCntCheck = req.Device.SkipFCntCheck
 		d.ReferenceAltitude = req.Device.ReferenceAltitude
+		d.IsDisabled = req.Device.IsDisabled
 		d.Variables = hstore.Hstore{
 			Map: make(map[string]sql.NullString),
 		}
@@ -376,15 +434,6 @@ func (a *DeviceAPI) CreateKeys(ctx context.Context, req *pb.CreateDeviceKeysRequ
 		}
 	}
 
-	// genAppKey is only for LoRaWAN 1.0 devices that implement the
-	// remote multicast setup specification.
-	var genAppKey lorawan.AES128Key
-	if req.DeviceKeys.GenAppKey != "" {
-		if err := genAppKey.UnmarshalText([]byte(req.DeviceKeys.GenAppKey)); err != nil {
-			return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
-		}
-	}
-
 	// nwkKey
 	var nwkKey lorawan.AES128Key
 	if err := nwkKey.UnmarshalText([]byte(req.DeviceKeys.NwkKey)); err != nil {
@@ -404,10 +453,9 @@ func (a *DeviceAPI) CreateKeys(ctx context.Context, req *pb.CreateDeviceKeysRequ
 	}
 
 	err := storage.CreateDeviceKeys(ctx, storage.DB(), &storage.DeviceKeys{
-		DevEUI:    eui,
-		NwkKey:    nwkKey,
-		AppKey:    appKey,
-		GenAppKey: genAppKey,
+		DevEUI: eui,
+		NwkKey: nwkKey,
+		AppKey: appKey,
 	})
 	if err != nil {
 		return nil, helpers.ErrToRPCError(err)
@@ -436,10 +484,9 @@ func (a *DeviceAPI) GetKeys(ctx context.Context, req *pb.GetDeviceKeysRequest) (
 
 	return &pb.GetDeviceKeysResponse{
 		DeviceKeys: &pb.DeviceKeys{
-			DevEui:    eui.String(),
-			AppKey:    dk.AppKey.String(),
-			NwkKey:    dk.NwkKey.String(),
-			GenAppKey: dk.GenAppKey.String(),
+			DevEui: eui.String(),
+			AppKey: dk.AppKey.String(),
+			NwkKey: dk.NwkKey.String(),
 		},
 	}, nil
 }
@@ -454,15 +501,6 @@ func (a *DeviceAPI) UpdateKeys(ctx context.Context, req *pb.UpdateDeviceKeysRequ
 	// appKey is not used for LoRaWAN 1.0
 	if req.DeviceKeys.AppKey != "" {
 		if err := appKey.UnmarshalText([]byte(req.DeviceKeys.AppKey)); err != nil {
-			return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
-		}
-	}
-
-	// genAppKey is only for LoRaWAN 1.0 devices that implement the
-	// remote multicast setup specification.
-	var genAppKey lorawan.AES128Key
-	if req.DeviceKeys.GenAppKey != "" {
-		if err := genAppKey.UnmarshalText([]byte(req.DeviceKeys.GenAppKey)); err != nil {
 			return nil, grpc.Errorf(codes.InvalidArgument, err.Error())
 		}
 	}
@@ -489,7 +527,6 @@ func (a *DeviceAPI) UpdateKeys(ctx context.Context, req *pb.UpdateDeviceKeysRequ
 	}
 	dk.NwkKey = nwkKey
 	dk.AppKey = appKey
-	dk.GenAppKey = genAppKey
 
 	err = storage.UpdateDeviceKeys(ctx, storage.DB(), &dk)
 	if err != nil {
@@ -596,15 +633,6 @@ func (a *DeviceAPI) Activate(ctx context.Context, req *pb.ActivateDeviceRequest)
 		return nil, helpers.ErrToRPCError(err)
 	}
 
-	dp, err := storage.GetDeviceProfile(ctx, storage.DB(), d.DeviceProfileID, false, false)
-	if err != nil {
-		return nil, helpers.ErrToRPCError(err)
-	}
-
-	if dp.DeviceProfile.SupportsJoin {
-		return nil, grpc.Errorf(codes.FailedPrecondition, "node must be an ABP node")
-	}
-
 	n, err := storage.GetNetworkServerForDevEUI(ctx, storage.DB(), devEUI)
 	if err != nil {
 		return nil, helpers.ErrToRPCError(err)
@@ -632,18 +660,20 @@ func (a *DeviceAPI) Activate(ctx context.Context, req *pb.ActivateDeviceRequest)
 		},
 	}
 
-	_, err = nsClient.ActivateDevice(ctx, &actReq)
-	if err != nil {
-		return nil, helpers.ErrToRPCError(err)
-	}
+	err = storage.Transaction(func(db sqlx.Ext) error {
+		if err := storage.UpdateDeviceActivation(ctx, db, d.DevEUI, devAddr, appSKey); err != nil {
+			return helpers.ErrToRPCError(err)
+		}
 
-	err = storage.CreateDeviceActivation(ctx, storage.DB(), &storage.DeviceActivation{
-		DevEUI:  d.DevEUI,
-		DevAddr: devAddr,
-		AppSKey: appSKey,
+		_, err := nsClient.ActivateDevice(ctx, &actReq)
+		if err != nil {
+			return helpers.ErrToRPCError(err)
+		}
+
+		return nil
 	})
 	if err != nil {
-		return nil, helpers.ErrToRPCError(err)
+		return nil, err
 	}
 
 	log.WithFields(log.Fields{
@@ -677,11 +707,6 @@ func (a *DeviceAPI) GetActivation(ctx context.Context, req *pb.GetDeviceActivati
 		return nil, helpers.ErrToRPCError(err)
 	}
 
-	da, err := storage.GetLastDeviceActivationForDevEUI(ctx, storage.DB(), devEUI)
-	if err != nil {
-		return nil, helpers.ErrToRPCError(err)
-	}
-
 	n, err := storage.GetNetworkServerForDevEUI(ctx, storage.DB(), devEUI)
 	if err != nil {
 		return nil, helpers.ErrToRPCError(err)
@@ -706,9 +731,9 @@ func (a *DeviceAPI) GetActivation(ctx context.Context, req *pb.GetDeviceActivati
 
 	return &pb.GetDeviceActivationResponse{
 		DeviceActivation: &pb.DeviceActivation{
-			DevEui:      da.DevEUI.String(),
+			DevEui:      d.DevEUI.String(),
 			DevAddr:     devAddr.String(),
-			AppSKey:     da.AppSKey.String(),
+			AppSKey:     d.AppSKey.String(),
 			NwkSEncKey:  nwkSEncKey.String(),
 			SNwkSIntKey: sNwkSIntKey.String(),
 			FNwkSIntKey: fNwkSIntKey.String(),
@@ -753,6 +778,10 @@ func (a *DeviceAPI) StreamFrameLogs(req *pb.StreamDeviceFrameLogsRequest, srv pb
 	for {
 		resp, err := streamClient.Recv()
 		if err != nil {
+			if grpc.Code(err) == codes.Canceled {
+				return nil
+			}
+
 			return err
 		}
 
@@ -906,7 +935,7 @@ func (a *DeviceAPI) returnList(count int, devices []storage.DeviceListItem) (*pb
 	return &resp, nil
 }
 
-func convertUplinkAndDownlinkFrames(up *gw.UplinkFrameSet, down *gw.DownlinkFrame, decodeMACCommands bool) (*pb.UplinkFrameLog, *pb.DownlinkFrameLog, error) {
+func convertUplinkAndDownlinkFrames(up *ns.UplinkFrameLog, down *ns.DownlinkFrameLog, decodeMACCommands bool) (*pb.UplinkFrameLog, *pb.DownlinkFrameLog, error) {
 	var phy lorawan.PHYPayload
 
 	if up != nil {
@@ -952,9 +981,13 @@ func convertUplinkAndDownlinkFrames(up *gw.UplinkFrameSet, down *gw.DownlinkFram
 	}
 
 	if down != nil {
+		var gatewayID lorawan.EUI64
+		copy(gatewayID[:], down.GatewayId)
+
 		downlinkFrameLog := pb.DownlinkFrameLog{
 			TxInfo:         down.TxInfo,
 			PhyPayloadJson: string(phyJSON),
+			GatewayId:      gatewayID.String(),
 		}
 
 		return nil, &downlinkFrameLog, nil

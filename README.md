@@ -12,12 +12,12 @@ and payloads can be enqueued by using MQTT or the API.
 
 ## Architecture
 
-![architecture](https://www.chirpstack.io/img/graphs/architecture.png)
+![architecture](https://www.chirpstack.io/static/img/graphs/architecture.dot.png)
 
 ### Component links
 
 * [ChirpStack Gateway Bridge](https://www.chirpstack.io/gateway-bridge/)
-* [ChirpStack Network Server](https://www.chirpstack.io/application-server/)
+* [ChirpStack Network Server](https://www.chirpstack.io/network-server/)
 * [ChirpStack Application Server](https://www.chirpstack.io/application-server/)
 
 ## Links

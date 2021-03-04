@@ -39,29 +39,26 @@ class MulticastGroupForm extends FormComponent {
   }
 
   getServiceProfileOptions(search, callbackFunc) {
-    ServiceProfileStore.list(this.props.match.params.organizationID, 999, 0, resp => {
+    ServiceProfileStore.list(this.props.match.params.organizationID, 0, 999, 0, resp => {
       const options = resp.result.map((sp, i) => {return {label: sp.name, value: sp.id}});
       callbackFunc(options);
     });
   }
 
   getRandomKey(len) {
-    let key = "";
-    const possible = 'abcdef0123456789';
+    let cryptoObj = window.crypto || window.msCrypto;
+    let b = new Uint8Array(len);
+    cryptoObj.getRandomValues(b);
 
-    for(let i = 0; i < len; i++){
-      key += possible.charAt(Math.floor(Math.random() * possible.length));
-    }
-
-    return key;
+    return Buffer.from(b).toString('hex');
   }
 
   getRandomMcAddr = (cb) => {
-    cb(this.getRandomKey(8));
+    cb(this.getRandomKey(4));
   }
 
   getRandomSessionKey = (cb) => {
-    cb(this.getRandomKey(32));
+    cb(this.getRandomKey(16));
   }
 
 
@@ -119,6 +116,7 @@ class MulticastGroupForm extends FormComponent {
             getOption={this.getServiceProfileOption}
             getOptions={this.getServiceProfileOptions}
             margin="none"
+            required
           />
           <FormHelperText>
             The service-profile to which this multicast-group will be attached. Note that you can't change this value after the multicast-group has been created.
@@ -198,6 +196,7 @@ class MulticastGroupForm extends FormComponent {
             value={this.state.object.groupType || ""}
             onChange={this.onChange}
             getOptions={this.getGroupTypeOptions}
+            required
           />
           <FormHelperText>
             The multicast-group type defines the way how multicast frames are scheduled by the network-server.
@@ -211,6 +210,7 @@ class MulticastGroupForm extends FormComponent {
             value={this.state.object.pingSlotPeriod || ""}
             onChange={this.onChange}
             getOptions={this.getPingSlotPeriodOptions}
+            required
           />
           <FormHelperText>Class-B ping-slot periodicity.</FormHelperText>
         </FormControl>}

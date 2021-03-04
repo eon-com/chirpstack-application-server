@@ -1,4 +1,4 @@
-FROM golang:1.13-alpine AS development
+FROM golang:1.14-alpine AS development
 
 ENV PROJECT_PATH=/chirpstack-application-server
 ENV PATH=$PATH:$PROJECT_PATH/build
@@ -14,9 +14,8 @@ WORKDIR $PROJECT_PATH
 RUN make dev-requirements ui-requirements
 RUN make
 
-FROM alpine:latest AS production
+FROM alpine:3.11.2 AS production
 
-WORKDIR /root/
 RUN apk --no-cache add ca-certificates
-COPY --from=development /chirpstack-application-server/build/chirpstack-application-server .
-ENTRYPOINT ["./chirpstack-application-server"]
+COPY --from=development /chirpstack-application-server/build/chirpstack-application-server /usr/bin/chirpstack-application-server
+ENTRYPOINT ["/usr/bin/chirpstack-application-server"]

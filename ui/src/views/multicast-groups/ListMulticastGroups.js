@@ -38,10 +38,13 @@ class ListMulticastGroups extends Component {
 
   getRow(obj) {
     return(
-      <TableRow key={obj.id}>
+      <TableRow
+        key={obj.id}
+        hover
+      >
         <TableCell>{obj.id}</TableCell>
         <TableCellLink to={`/organizations/${this.props.match.params.organizationID}/multicast-groups/${obj.id}`}>{obj.name}</TableCellLink>
-        <TableCellLink to={`/organizations/${this.props.match.params.organizationID}/service-profiles/${obj.serviceProfileID}`}>{obj.serviceProfileName}</TableCellLink>
+        <TableCell>{obj.serviceProfileName}</TableCell>
       </TableRow>
     );
   }

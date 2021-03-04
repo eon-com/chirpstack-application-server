@@ -9,13 +9,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 
-	pb "github.com/brocaar/chirpstack-api/go/as/external/api"
+	pb "github.com/brocaar/chirpstack-api/go/v3/as/external/api"
+	"github.com/brocaar/chirpstack-api/go/v3/ns"
 	"github.com/brocaar/chirpstack-application-server/internal/api/external/auth"
 	"github.com/brocaar/chirpstack-application-server/internal/api/helpers"
 	"github.com/brocaar/chirpstack-application-server/internal/backend/networkserver"
 	"github.com/brocaar/chirpstack-application-server/internal/multicast"
 	"github.com/brocaar/chirpstack-application-server/internal/storage"
-	"github.com/brocaar/chirpstack-api/go/ns"
 	"github.com/brocaar/lorawan"
 )
 
@@ -287,12 +287,12 @@ func (a *MulticastGroupAPI) List(ctx context.Context, req *pb.ListMulticastGroup
 
 	// listing all stored objects is for global admin only
 	if !idFilter {
-		isAdmin, err := a.validator.GetIsAdmin(ctx)
+		user, err := a.validator.GetUser(ctx)
 		if err != nil {
 			return nil, helpers.ErrToRPCError(err)
 		}
 
-		if !isAdmin {
+		if !user.IsAdmin {
 			return nil, grpc.Errorf(codes.Unauthenticated, "client must be global admin for unfiltered request")
 		}
 	}
@@ -490,7 +490,7 @@ func (a *MulticastGroupAPI) ListQueue(ctx context.Context, req *pb.ListMulticast
 	}
 
 	var resp pb.ListMulticastGroupQueueItemsResponse
-	for i, _ := range queueItems {
+	for i := range queueItems {
 		resp.MulticastQueueItems = append(resp.MulticastQueueItems, &queueItems[i])
 	}
 
